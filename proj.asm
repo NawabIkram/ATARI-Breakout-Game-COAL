@@ -25,6 +25,8 @@ level: db 1
 maxLevel: db 3
 selectedLevel: db 1
 levelSelectActive: db 0
+gamePaused: db 0          ; New: Game pause state
+pauseKeyPressed: db 0     ; New: Track pause key state
 
 ; Arrays
 bricks: times 32 db 1
@@ -61,6 +63,7 @@ rule4: db 'Each brick = points by color', 0
 rule5: db 'Dont let ball fall!', 0
 rule6: db 'NEW: Progressive difficulty levels!', 0
 rule7: db 'Press L for Level Selection', 0
+rule8: db 'Press P to Pause/Resume', 0       ; New: Pause rule
 startMsg: db 'Press ENTER to Start', 0
 exitMsg: db 'Press ESC to Exit', 0
 
@@ -82,6 +85,8 @@ playAgainMsg: db 'ENTER=Play Again | ESC=Exit', 0
 newHighMsg: db 'NEW HIGH SCORE!', 0
 saveErrorMsg: db 'Error saving high score!', 0
 levelUpMsg: db '*** LEVEL UP! ***', 0
+pauseMsg: db '*** GAME PAUSED ***', 0        ; New: Pause message
+pauseInstMsg: db 'Press P to Resume', 0      ; New: Pause instruction
 
 ; Keyboard handling
 oldKbdISR: dd 0
@@ -119,11 +124,30 @@ mainGameStart:
 gameLoop:
     cmp byte [gameActive], 0
     je gameEnd
+    
+    ; Check if game is paused
+    cmp byte [gamePaused], 1
+    je handlePausedState
+    
+    ; Normal game state - process movement
     call movePaddleSmooth
     call movePaddleSmooth
     call delay
     call moveBall
     call drawGame
+    jmp checkExitKey
+    
+handlePausedState:
+    ; Draw paused screen
+    call drawGame
+    call showPauseScreen
+    ; Small delay to prevent CPU overuse
+    mov cx, 0x1FFF
+pauseDelay:
+    nop
+    loop pauseDelay
+    
+checkExitKey:
     cmp byte [keyPressed], 27
     je gameEnd
     jmp gameLoop
@@ -143,6 +167,45 @@ exitProgram:
     int 0x10
     mov ax, 0x4C00
     int 0x21
+
+; New: Show pause screen overlay
+showPauseScreen:
+    pusha
+    ; Draw semi-transparent overlay
+    mov cx, 0
+drawPauseOverlay:
+    push cx
+    mov dh, cl
+    mov dl, 25
+    call setCursor
+    mov ah, 0x09
+    mov al, ' '
+    mov bh, 0
+    mov bl, 0x70  ; Gray background
+    mov cx, 30
+    int 0x10
+    pop cx
+    inc cx
+    cmp cx, 20
+    jl drawPauseOverlay
+    
+    ; Display pause message
+    mov dh, 10
+    mov dl, 30
+    call setCursor
+    mov si, pauseMsg
+    mov bl, 0x4F  ; White on red
+    call printStringColor
+    
+    ; Display pause instruction
+    mov dh, 12
+    mov dl, 32
+    call setCursor
+    mov si, pauseInstMsg
+    mov bl, 0x0F  ; White on black
+    call printStringColor
+    popa
+    ret
 
 ; Level selection display
 showLevelSelect:
@@ -318,6 +381,7 @@ initGame:
     mov byte [ballDirY], -1
     mov byte [paddleX], 32
     mov byte [gameActive], 1
+    mov byte [gamePaused], 0      ; New: Initialize pause state
     mov word [bricksRemaining], 32
     call readHighScore
     
@@ -349,6 +413,7 @@ applyLevelSettings:
     mov byte [paddleTimer], 0
     mov byte [paddleAcceleration], 1
     mov byte [ballSpeedCounter], 0
+    mov byte [pauseKeyPressed], 0  ; New: Reset pause key state
     
     ; Reset bricks
     mov cx, 32
@@ -401,7 +466,7 @@ levelUpPauseLoop:
     popa
     ret
 
-; Keyboard interrupt handler
+; Keyboard interrupt handler - UPDATED WITH PAUSE FUNCTIONALITY
 hookKeyboard:
     pusha
     mov ax, 0x3509
@@ -445,6 +510,17 @@ kbdISR:
     in al, 0x60
     mov byte [keyPressed], al
     
+    ; Check for pause key (P or p)
+    cmp al, 0x19        ; 'P' pressed
+    je togglePause
+    cmp al, 0x99        ; 'P' released
+    je clearPauseKey
+    cmp al, 0x18        ; 'p' pressed (lowercase)
+    je togglePause
+    cmp al, 0x98        ; 'p' released (lowercase)
+    je clearPauseKey
+    
+    ; Original key checks
     cmp al, 0x4B        ; Left arrow pressed
     je setLeftKey
     cmp al, 0xCB        ; Left arrow released
@@ -453,6 +529,30 @@ kbdISR:
     je setRightKey
     cmp al, 0xCD        ; Right arrow released
     je clearRightKey
+    jmp kbdISRDone
+
+togglePause:
+    cmp byte [pauseKeyPressed], 1
+    je kbdISRDone  ; Already processed this key press
+    mov byte [pauseKeyPressed], 1
+    
+    ; Toggle pause state only if game is active
+    cmp byte [gameActive], 1
+    jne kbdISRDone
+    xor byte [gamePaused], 1
+    
+    ; Play pause/resume sound
+    cmp byte [gamePaused], 1
+    je playPauseSound
+    call playResumeSound
+    jmp kbdISRDone
+    
+playPauseSound:
+    call playPauseTone
+    jmp kbdISRDone
+
+clearPauseKey:
+    mov byte [pauseKeyPressed], 0
     jmp kbdISRDone
 
 setLeftKey:
@@ -476,9 +576,37 @@ kbdISRDone:
     popa
     iret
 
+; New: Pause sound effect
+playPauseTone:
+    pusha
+    mov word [soundFreq], 523
+    mov word [soundDuration], 2
+    call playTone
+    mov word [soundFreq], 440
+    mov word [soundDuration], 2
+    call playTone
+    popa
+    ret
+
+; New: Resume sound effect
+playResumeSound:
+    pusha
+    mov word [soundFreq], 440
+    mov word [soundDuration], 2
+    call playTone
+    mov word [soundFreq], 523
+    mov word [soundDuration], 2
+    call playTone
+    popa
+    ret
+
 ; Improved smooth paddle movement
 movePaddleSmooth:
     pusha
+    
+    ; Don't move paddle if game is paused
+    cmp byte [gamePaused], 1
+    je near paddleMoveDone
     
     ; Base movement speed (improved)
     mov bl, 4
@@ -540,9 +668,9 @@ moveRightPaddle:
 
 resetPaddleCounters:
     cmp byte [leftKey], 0
-    jne paddleMoveDone
+    jne near paddleMoveDone
     cmp byte [rightKey], 0
-    jne paddleMoveDone
+    jne near paddleMoveDone
     mov byte [leftSpeedCounter], 0
     mov byte [rightSpeedCounter], 0
 
@@ -553,6 +681,11 @@ paddleMoveDone:
 ; Ball movement
 moveBall:
     pusha
+    
+    ; Don't move ball if game is paused
+    cmp byte [gamePaused], 1
+    je near ballMoveDone
+    
     inc byte [ballSpeedCounter]
     mov al, [ballSpeedCounter]
     cmp al, [ballSpeedDelay]
@@ -618,12 +751,12 @@ checkPaddleCollision:
 
 checkBrickCollision:
     mov ax, [ballY]
-    cmp ax, 5
+    cmp ax, 4          ; Changed from 3 to 4 (row 3 instead of row 2)
     jl checkBottomBoundary
-    cmp ax, 8
+    cmp ax, 7          ; Changed from 6 to 7 (row 6 instead of row 5)
     jg checkBottomBoundary
     
-    sub ax, 5
+    sub ax, 4          ; Changed from 3 to 4
     mov si, ax
     mov bx, ax
     shl bx, 3
@@ -858,7 +991,7 @@ drawBrickRows:
     jge drawBricksDone
     
     mov dh, al
-    add dh, 4
+    add dh, 3          ; Changed from 2 to 3 (row 3 instead of row 2)
     mov al, [currentRow]
     mov bl, 8
     mul bl
@@ -955,7 +1088,7 @@ drawBricksDone:
     popa
     ret
 
-; Show welcome screen
+; Show welcome screen - UPDATED WITH PAUSE INSTRUCTION
 showWelcome:
     pusha
     ; Clear screen
@@ -1103,14 +1236,21 @@ drawWelcomeSides:
     mov bl, 0x0C
     call printStringColor
     
-    mov dh, 20
+    mov dh, 19           ; New: Added pause instruction line
+    mov dl, 16
+    call setCursor
+    mov si, rule8
+    mov bl, 0x09
+    call printStringColor
+    
+    mov dh, 21           ; Adjusted line numbers
     mov dl, 25
     call setCursor
     mov si, startMsg
     mov bl, 0x0A
     call printStringColor
     
-    mov dh, 21
+    mov dh, 22           ; Adjusted line numbers
     mov dl, 25
     call setCursor
     mov si, exitMsg
